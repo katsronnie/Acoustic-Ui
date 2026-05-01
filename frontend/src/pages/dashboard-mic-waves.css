@@ -1,0 +1,65 @@
+/* ─────────────────────────────────────────────
+   signal-overlay — fills ward-scene, sits
+   above background but below bed markers.
+───────────────────────────────────────────── */
+.signal-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────
+   Mic Breathing Rings (SVG @keyframes)
+───────────────────────────────────────────── */
+@keyframes mic-ring-collapse {
+  0%   { r: 16; stroke-opacity: 0;    stroke-width: 0.2; }
+  30%  { r: 12; stroke-opacity: 0.14; stroke-width: 0.5; }
+  100% { r: 2;  stroke-opacity: 0.55; stroke-width: 1.2; }
+}
+
+.mic-breathing-ring {
+  animation: mic-ring-collapse var(--period, 3.75s) ease-in infinite;
+  animation-delay: var(--delay, 0s);
+  stroke: var(--ring-color, #4cdb8f);
+  fill: none;
+  pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────
+   Mic container — wraps the mic icon + wave.
+   Position relative so the wave canvas can
+   anchor itself to the mic icon.
+───────────────────────────────────────────── */
+.mic-with-wave {
+  position: absolute;   /* keeps existing absolute positioning from mic-a/b/c/d */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* ─────────────────────────────────────────────
+   Audio wave canvas — sits directly beneath
+   or beside the mic icon with no gap.
+───────────────────────────────────────────── */
+.mic-audio-wave {
+  pointer-events: none;
+  display: block;
+  border-radius: 3px;
+}
+
+/* Top/bottom mics (mic-a, mic-d) → horizontal wave below the icon */
+.mic-audio-wave--horizontal {
+  width: 90px;
+  height: 28px;
+  margin-top: 2px;      /* tight gap below mic icon */
+}
+
+/* Left/right mics (mic-b, mic-c) → vertical wave beside the icon */
+.mic-audio-wave--vertical {
+  width: 28px;
+  height: 80px;
+  margin-top: -8px;     /* overlaps slightly so wave looks connected */
+}
