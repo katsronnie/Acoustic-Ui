@@ -1,3 +1,7 @@
+# Model files (stored on Hugging Face Spaces instead)
+model.pth
+pretrained_models/
+
 # OS and editor files
 .DS_Store
 Thumbs.db

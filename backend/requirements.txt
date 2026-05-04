@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 python-multipart
+requests
 torch
 torchaudio
 speechbrain

@@ -8,6 +8,7 @@ import tempfile
 import torchaudio
 import torch.nn.functional as F
 import logging
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,6 +35,16 @@ import torch.serialization as serialization
 
 serialization.add_safe_globals([SepformerSeparation])
 
+HF_ANALYZE_URL = (
+    os.getenv("HF_ANALYZE_URL")
+    or os.getenv("HF_INFERENCE_URL")
+    or os.getenv("HF_SPACE_URL")
+    or ""
+).strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+HF_TIMEOUT_SECONDS = float(os.getenv("HF_TIMEOUT_SECONDS", "120"))
+USE_REMOTE_INFERENCE = bool(HF_ANALYZE_URL)
+
 
 def load_local_model():
     model_path = os.path.join(os.path.dirname(__file__), "model.pth")
@@ -49,38 +60,161 @@ def load_local_model():
             pathlib.PosixPath = original_posix_path
 
 
-model = load_local_model()
-
-# Ensure the loaded SpeechBrain model runs on CPU even if it was trained/configured for CUDA.
-try:
-    cpu_device = torch.device("cpu")
-    # Try the simple API first
+def move_model_to_cpu(model_instance):
+    """Ensure the loaded SpeechBrain model runs on CPU."""
     try:
-        model.to(cpu_device)
-    except Exception:
-        pass
+        cpu_device = torch.device("cpu")
 
-    # Set device attribute expected by SpeechBrain inference helpers
+        try:
+            model_instance.to(cpu_device)
+        except Exception:
+            pass
+
+        try:
+            setattr(model_instance, "device", cpu_device)
+        except Exception:
+            pass
+
+        if hasattr(model_instance, "mods"):
+            for attr in dir(model_instance.mods):
+                submodule = getattr(model_instance.mods, attr)
+                try:
+                    if isinstance(submodule, torch.nn.Module):
+                        submodule.to(cpu_device)
+                except Exception:
+                    continue
+    except Exception as error:
+        logger.warning(f"Could not force model to CPU cleanly: {error}")
+
+
+model = None
+
+if not USE_REMOTE_INFERENCE:
+    model = load_local_model()
+    move_model_to_cpu(model)
+
+
+def build_analysis_response(payload, bed_id=None, provider="local"):
+    response = dict(payload)
+    response.setdefault("status", "processed")
+    response.setdefault("provider", provider)
+    if bed_id and not response.get("bed_id"):
+        response["bed_id"] = bed_id
+    return response
+
+
+def analyze_with_huggingface(audio_path, bed_id=None):
+    if not HF_ANALYZE_URL:
+        raise RuntimeError("HF_ANALYZE_URL is not configured")
+
+    headers = {}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    with open(audio_path, "rb") as audio_file:
+        files = {
+            "file": (
+                os.path.basename(audio_path),
+                audio_file,
+                "audio/wav",
+            )
+        }
+        data = {}
+        if bed_id:
+            data["bed_id"] = bed_id
+
+        response = requests.post(
+            HF_ANALYZE_URL,
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=HF_TIMEOUT_SECONDS,
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Hugging Face inference failed with {response.status_code}: {response.text}"
+        )
+
     try:
-        setattr(model, "device", cpu_device)
-    except Exception:
-        pass
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError("Hugging Face inference did not return JSON") from error
 
-    # Move submodules to CPU (mods may contain encoder/masknet/decoder)
-    if hasattr(model, "mods"):
-        for attr in dir(model.mods):
-            sub = getattr(model.mods, attr)
-            try:
-                if isinstance(sub, torch.nn.Module):
-                    sub.to(cpu_device)
-            except Exception:
-                continue
-except Exception as _err:
-    logger.warning(f"Could not force model to CPU cleanly: {_err}")
+
+def analyze_with_local_model(audio_path):
+    if model is None:
+        raise RuntimeError("Local model is not loaded")
+
+    waveform, sample_rate = torchaudio.load(audio_path)
+    logger.info(f"Loaded audio: shape={tuple(waveform.shape)}, sample_rate={sample_rate}")
+
+    if waveform.dim() > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    else:
+        waveform = waveform.unsqueeze(0)
+
+    model_sample_rate = getattr(model.hparams, "sample_rate", sample_rate)
+    if sample_rate != model_sample_rate:
+        logger.info(f"Resampling audio from {sample_rate} Hz to {model_sample_rate} Hz")
+        waveform = torchaudio.transforms.Resample(
+            orig_freq=sample_rate,
+            new_freq=model_sample_rate,
+        )(waveform)
+
+    logger.info(f"Running model.separate_batch on waveform with shape {tuple(waveform.shape)}")
+    separated = model.separate_batch(waveform)
+    logger.info(
+        f"Separation complete, output type: {type(separated)}, shape: {separated.shape if isinstance(separated, torch.Tensor) else 'unknown'}"
+    )
+    if isinstance(separated, torch.Tensor):
+        logger.info(
+            f"Separated output stats - min: {separated.min():.4f}, max: {separated.max():.4f}, mean: {separated.mean():.4f}"
+        )
+
+    if isinstance(separated, torch.Tensor):
+        logger.info(f"Separated tensor shape: {separated.shape}, dims: {separated.dim()}")
+        source_count = int(separated.shape[-1]) if separated.dim() >= 3 else 1
+        if separated.dim() >= 3:
+            if separated.shape[-1] <= 4:
+                primary_source = separated[0, :, 0]
+            else:
+                primary_source = separated[0, 0, :]
+        else:
+            primary_source = separated.squeeze()
+    elif isinstance(separated, (list, tuple)) and separated:
+        primary_source = separated[0]
+        source_count = len(separated)
+    else:
+        primary_source = torch.as_tensor(separated)
+        source_count = 1
+
+    if not isinstance(primary_source, torch.Tensor):
+        primary_source = torch.as_tensor(primary_source)
+
+    waveform = primary_source.detach().cpu()
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    analysis = analyze_waveform(waveform, model_sample_rate)
+    logger.info(f"Analysis result: {analysis}")
+    return build_analysis_response(
+        {
+            "model": "model.pth",
+            "sources_detected": source_count,
+            **analysis,
+        },
+        provider="local",
+    )
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "inference_provider": "huggingface" if USE_REMOTE_INFERENCE else "local",
+        "huggingface_configured": USE_REMOTE_INFERENCE,
+    }
 
 def analyze_waveform(waveform, sample_rate):
     if waveform.dim() > 1:
@@ -208,62 +342,15 @@ async def analyze(file: UploadFile = File(...), bed_id: str | None = Form(defaul
     logger.info(f"Saved audio to {audio_path}, file size: {os.path.getsize(audio_path)} bytes")
 
     try:
-        waveform, sample_rate = torchaudio.load(audio_path)
-        logger.info(f"Loaded audio: shape={tuple(waveform.shape)}, sample_rate={sample_rate}")
-        
-        if waveform.dim() > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        else:
-            waveform = waveform.unsqueeze(0)
+        if USE_REMOTE_INFERENCE:
+            logger.info(f"Forwarding audio to Hugging Face endpoint: {HF_ANALYZE_URL}")
+            analysis = analyze_with_huggingface(audio_path, bed_id=bed_id)
+            logger.info(f"Remote analysis result: {analysis}")
+            return build_analysis_response(analysis, bed_id=bed_id, provider="huggingface")
 
-        model_sample_rate = getattr(model.hparams, "sample_rate", sample_rate)
-        if sample_rate != model_sample_rate:
-            logger.info(f"Resampling audio from {sample_rate} Hz to {model_sample_rate} Hz")
-            waveform = torchaudio.transforms.Resample(
-                orig_freq=sample_rate,
-                new_freq=model_sample_rate,
-            )(waveform)
-
-        logger.info(f"Running model.separate_batch on waveform with shape {tuple(waveform.shape)}")
-        separated = model.separate_batch(waveform)
-        logger.info(f"Separation complete, output type: {type(separated)}, shape: {separated.shape if isinstance(separated, torch.Tensor) else 'unknown'}")
-        if isinstance(separated, torch.Tensor):
-            logger.info(f"Separated output stats - min: {separated.min():.4f}, max: {separated.max():.4f}, mean: {separated.mean():.4f}")
-
-        if isinstance(separated, torch.Tensor):
-            logger.info(f"Separated tensor shape: {separated.shape}, dims: {separated.dim()}")
-            source_count = int(separated.shape[-1]) if separated.dim() >= 3 else 1
-            # Extract the first separated source (typically speech/breathing)
-            if separated.dim() >= 3:
-                if separated.shape[-1] <= 4:
-                    primary_source = separated[0, :, 0]
-                else:
-                    primary_source = separated[0, 0, :]
-            else:
-                primary_source = separated.squeeze()
-        elif isinstance(separated, (list, tuple)) and separated:
-            primary_source = separated[0]
-            source_count = len(separated)
-        else:
-            primary_source = torch.as_tensor(separated)
-            source_count = 1
-
-        if not isinstance(primary_source, torch.Tensor):
-            primary_source = torch.as_tensor(primary_source)
-
-        waveform = primary_source.detach().cpu()
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-
-        analysis = analyze_waveform(waveform, model_sample_rate)
-        logger.info(f"Analysis result: {analysis}")
-        return {
-            "status": "processed",
-            "model": "model.pth",
-            "bed_id": bed_id,
-            "sources_detected": source_count,
-            **analysis,
-        }
+        analysis = analyze_with_local_model(audio_path)
+        analysis["bed_id"] = bed_id
+        return analysis
     except Exception as e:
         logger.error(f"Error processing audio: {str(e)}", exc_info=True)
         return JSONResponse(

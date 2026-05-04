@@ -215,7 +215,7 @@ export default function App() {
   const [selectedBed, setSelectedBed] = useState(1);
   const [alerts, setAlerts] = useState([]);
   const [currentPage, setCurrentPage] = useState("dashboard");
-  const backendUrl = "http://127.0.0.1:8000";
+  const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
   const testBackendConnection = async () => {
     try {
@@ -274,7 +274,7 @@ export default function App() {
     
     const isBackendReachable = await testBackendConnection();
     if (!isBackendReachable) {
-      throw new Error("Cannot reach backend at http://127.0.0.1:8000. Make sure it's running.");
+      throw new Error(`Cannot reach backend at ${backendUrl}. Make sure it's running.`);
     }
 
     const formData = new FormData();
