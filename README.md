@@ -31,6 +31,14 @@ cd frontend
 npm run build
 ```
 
+To deploy the frontend on Vercel, set the project root to `frontend/`, add this environment variable in the Vercel project settings, and deploy the Vite build output:
+
+```bash
+VITE_BACKEND_URL=https://hospital-ward-acoustic-ui-backend.hf.space
+```
+
+Vercel will serve the React app globally, while the backend stays on Hugging Face Spaces.
+
 ## Backend
 
 Install Python dependencies from `backend/requirements.txt`, then start the API:
